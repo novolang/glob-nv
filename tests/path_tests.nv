@@ -1,0 +1,237 @@
+// path_tests.nv — the path reading: `*` inside one segment, `**`
+// across them, and the separator decision written as assertions.
+//
+// The `**` cases are the ones Rust's `glob` crate carries in its own
+// tests — `some/**/needle.txt` against a needle nought, one and two
+// directories down, and the `some/**` shapes — retyped here as calls
+// rather than vendored, so nothing carries anybody else's licence.
+// The rest are this package's own answers to questions `fnmatch` and
+// `glob` disagree about, each with the reason beside it.
+
+use std.test
+use glob
+
+fn expect(pattern: Str, path: Str, want: Bool) [io]
+    test.case("matches(${pattern}, ${path})")
+    test.assert(glob.matches(pattern, path) == want)
+
+// ── the decision: `*` does not cross a separator ─────────────────────
+
+@test
+fn test_a_star_stays_inside_one_path_segment() [io]
+    // THE decision this package had to make, and the one the README
+    // leads with.  `fnmatch.fnmatch("a/b", "*")` is TRUE in Python;
+    // `glob.glob("*")` never returns `a/b`.  A build tool wants the
+    // second reading — `src/*.nv` naming the sources in one directory
+    // and not the whole tree — so that is what `matches` does, and
+    // `matches_name` is where the first reading lives.
+    expect("*", "abc", true)
+    expect("*", "a/b", false)
+    expect("src/*.nv", "src/main.nv", true)
+    expect("src/*.nv", "src/a/b.nv", false)
+    expect("*/*", "a/b", true)
+    expect("*/*", "a/b/c", false)
+    // `?` and a character class are the same rule: one byte, and never
+    // the separator.  `fnmatch` matches `/` with both.
+    expect("?", "a", true)
+    expect("?", "/", false)
+    expect("a?b", "a/b", false)
+    expect("a[/]b", "a/b", false)
+    // The other reading is one call away, and answers the other way.
+    test.case("matches_name is the fnmatch reading")
+    test.assert(glob.matches_name("*", "a/b"))
+    test.assert(glob.matches_name("a[/]b", "a/b"))
+
+// ── `**` ─────────────────────────────────────────────────────────────
+
+@test
+fn test_a_double_star_crosses_any_number_of_segments_including_none() [io]
+    expect("some/**/needle.txt", "some/needle.txt", true)
+    expect("some/**/needle.txt", "some/one/needle.txt", true)
+    expect("some/**/needle.txt", "some/one/two/needle.txt", true)
+    expect("some/**/needle.txt", "some/other/needle.txt/hello", false)
+    expect("**/needle.txt", "needle.txt", true)
+    expect("**/needle.txt", "a/b/needle.txt", true)
+    expect("some/*/needle.txt", "some/one/two/needle.txt", false)
+
+@test
+fn test_two_double_stars_collapse() [io]
+    expect("some/**/**/needle.txt", "some/one/two/needle.txt", true)
+    expect("some/**/**/needle.txt", "some/needle.txt", true)
+    expect("a/**/b/**/c", "a/b/c", true)
+    expect("a/**/b/**/c", "a/x/b/y/z/c", true)
+    expect("a/**/b/**/c", "a/x/y/c", false)
+
+@test
+fn test_a_trailing_double_star_matches_the_directory_itself() [io]
+    // `a/**` matches `a`, because `**` matches nought segments as
+    // readily as it matches five.  A caller who wants "strictly
+    // inside" writes `a/**/*`.
+    expect("some/**", "some", true)
+    expect("some/**", "some/path", true)
+    expect("some/**", "some/path/to", true)
+    expect("some/**", "someother", false)
+    expect("some/**/*", "some", false)
+    expect("some/**/*", "some/path", true)
+    expect("**", "a", true)
+    expect("**", "a/b/c", true)
+    expect("**", "", true)
+
+@test
+fn test_a_double_star_that_is_not_a_whole_segment_reads_as_one_star() [io]
+    // Rust's `glob` REFUSES to build this pattern; `Pattern::new`
+    // answers `InvalidRecursive`.  A `Bool` has no room for that, so
+    // `matches` degrades it to a single `*` — which stays inside the
+    // segment — and `check` is the call that refuses it.  A caller who
+    // wants Rust's behaviour asks `check` first, which is the whole
+    // reason `check` is separate.
+    expect("a**b", "aXb", true)
+    expect("a**b", "a/b", false)
+    expect("**c", "abc", true)
+    expect("**c", "a/c", false)
+    test.case("and check refuses it")
+    test.assert(not glob.is_valid("a**b"))
+    test.assert(not glob.is_valid("**c"))
+    test.assert(not glob.is_valid("src/***/x"))
+    test.assert(glob.is_valid("a/**/b"))
+
+// ── separators at the edges ──────────────────────────────────────────
+
+@test
+fn test_one_trailing_separator_is_dropped_from_both_sides() [io]
+    // `a/b` and `a/b/` name the same directory.  `fs.read_dir`, a
+    // hand-written join and a shell all produce both spellings, and a
+    // matcher that said yes to one and no to the other would be a bug
+    // report waiting.
+    expect("a/b", "a/b/", true)
+    expect("a/b/", "a/b", true)
+    expect("a/b/", "a/b/", true)
+    expect("*/b", "a/b/", true)
+    // ONE.  Two trailing separators leave an empty segment behind,
+    // which is a real segment and is matched as one.
+    expect("a/b", "a/b//", false)
+    expect("a/b/", "a/b//", false)
+    expect("a/b//", "a/b//", true)
+    expect("a/b/*", "a/b//", true)
+
+@test
+fn test_a_lone_separator_keeps_its_separator() [io]
+    // Dropping it would leave the empty string, which is a different
+    // path: `/` is the root and `""` is nothing.
+    expect("/", "/", true)
+    expect("/", "", false)
+    expect("", "", true)
+    expect("", "a", false)
+    expect("a", "", false)
+
+@test
+fn test_absolute_and_relative_are_different_paths() [io]
+    expect("/a/b", "/a/b", true)
+    expect("/a/b", "a/b", false)
+    expect("a/b", "/a/b", false)
+    expect("/**/b", "/a/b", true)
+    expect("/**/b", "a/b", false)
+    // A LEADING `**` is the one that reaches across the line, and it
+    // does so by the ordinary rule rather than by an exception: a
+    // leading `/` opens an empty first segment, `**` matches any number
+    // of segments including that one, and so `**/b` matches both
+    // spellings.  It is the pattern for "a `b` anywhere", which is what
+    // somebody writing it meant.
+    expect("**/b", "/a/b", true)
+    expect("**/b", "a/b", true)
+    expect("**", "/a/b", true)
+
+@test
+fn test_an_empty_interior_segment_is_a_segment() [io]
+    expect("a//b", "a//b", true)
+    expect("a/*/b", "a//b", true)
+    expect("a/b", "a//b", false)
+    expect("a/**/b", "a//b", true)
+
+// ── hidden files ─────────────────────────────────────────────────────
+
+@test
+fn test_the_leading_dot_rule_is_a_parameter_and_is_off_by_default() [io]
+    // Off by default, which is Rust's `glob` crate's default
+    // (`require_literal_leading_dot: false`).  Python's `glob` and
+    // every POSIX shell take the other one, and that is
+    // `shell_options`.
+    expect("*.nv", ".hidden.nv", true)
+    expect("*", ".git", true)
+    expect("**/x", ".git/x", true)
+    let sh = glob.shell_options()
+    test.case("shell_options: a leading dot must be written")
+    test.assert(not glob.matches_with("*.nv", ".hidden.nv", sh))
+    test.assert(glob.matches_with(".*.nv", ".hidden.nv", sh))
+    test.assert(not glob.matches_with("a/*", "a/.b", sh))
+    test.assert(glob.matches_with("a/.*", "a/.b", sh))
+    test.case("shell_options: a class cannot reach a leading dot either")
+    test.assert(not glob.matches_with("[.a]bc", ".bc", sh))
+    test.case("shell_options: ? cannot match a lone dot")
+    test.assert(not glob.matches_with("?", ".", sh))
+    test.case("shell_options: ** does not descend into a hidden segment")
+    test.assert(not glob.matches_with("**/x", ".git/x", sh))
+    test.assert(glob.matches_with("**/x", "a/x", sh))
+    test.assert(not glob.matches_with("**", ".git/x", sh))
+    test.assert(glob.matches_with("**", "a/b", sh))
+    test.case("shell_options: a dot inside a segment is an ordinary byte")
+    test.assert(glob.matches_with("*.nv", "main.nv", sh))
+
+// ── the walker's question ────────────────────────────────────────────
+
+@test
+fn test_may_descend_is_the_prefix_question() [io]
+    // A directory is worth opening when SOME path inside it could
+    // match.  Sharing the machine with `matches` is the point: two
+    // matchers that agreed today would disagree the first time one of
+    // them was fixed.
+    test.case("the literal prefix of the pattern")
+    test.assert(glob.may_descend("src/**/x.nv", "src"))
+    test.assert(glob.may_descend("src/**/x.nv", "src/a"))
+    test.assert(glob.may_descend("src/**/x.nv", "src/a/b"))
+    test.assert(not glob.may_descend("src/**/x.nv", "docs"))
+    test.case("a fixed-depth pattern prunes everything past its depth")
+    test.assert(glob.may_descend("src/*.nv", "src"))
+    test.assert(not glob.may_descend("src/*.nv", "src/sub"))
+    test.assert(not glob.may_descend("src/*.nv", "target"))
+    test.case("** admits everything below it")
+    test.assert(glob.may_descend("**", "anything/at/all"))
+    test.assert(glob.may_descend("**/*.nv", "a/b/c"))
+    test.case("a directory that matches outright is still worth opening")
+    test.assert(glob.may_descend("src/*", "src/sub"))
+    test.case("and the hidden rule prunes hidden directories")
+    let sh = glob.shell_options()
+    test.assert(not glob.may_descend_with("**/x.nv", ".git", sh))
+    test.assert(glob.may_descend_with("**/x.nv", "src", sh))
+
+// ── the two helpers a caller plans a walk with ───────────────────────
+
+@test
+fn test_has_magic_and_the_literal_prefix() [io]
+    test.case("has_magic")
+    test.assert(glob.has_magic("src/*.nv"))
+    test.assert(glob.has_magic("a?b"))
+    test.assert(glob.has_magic("[abc]"))
+    test.assert(glob.has_magic("a\\*b"))
+    test.assert(not glob.has_magic("src/main.nv"))
+    test.assert(not glob.has_magic(""))
+    test.case("literal_prefix_len stops at the first magical segment")
+    test.assert(glob.literal_prefix_len("src/main/*.nv") == 8)
+    test.assert(glob.literal_prefix_len("*.nv") == 0)
+    test.assert(glob.literal_prefix_len("src/main.nv") == 11)
+    test.assert(glob.literal_prefix_len("a/**/b") == 1)
+    test.assert(glob.literal_prefix_len("") == 0)
+
+// ── the pathological patterns, in path mode ──────────────────────────
+
+@test
+fn test_many_double_stars_against_a_deep_path() [io]
+    expect("**/**/**/**/x", "a/b/c/d/e/f/g/x", true)
+    expect("**/**/**/**/x", "a/b/c/d/e/f/g/y", false)
+    var deep = "x"
+    for _i in 0 .. 60
+        deep = "a/${deep}"
+    test.case("four double stars against a sixty-deep path")
+    test.assert(glob.matches("**/**/**/**/x", deep))
+    test.case("and the same path with the wrong leaf")
+    test.assert(not glob.matches("**/**/**/**/y", deep))

@@ -1,0 +1,36 @@
+// embedded_probe.nv — the package's device claim, as a program that
+// either builds for a Cortex-M or does not.
+//
+// `tests/orbit/test_glob_nv.sh` copies this and `src/glob.nv` into a
+// package of its own and runs
+//
+//   novo build --target=nrf52-qemu src/probe.nv
+//
+// `walk` is NOT copied, and that is the point of the split rather than
+// a convenience here: it knows about lists and the filesystem, and one
+// host-only function anywhere in a compilation unit is an undefined
+// symbol at embedded link time whether or not the firmware calls it.
+//
+// It builds, and the script BOOTS it: nothing in `glob` stands between
+// it and a device.  No call allocates, every loop is a counted `for`
+// over a bound computed before it starts, and the whole state of a
+// match is four `Int`s in a frame.
+//
+// It did not build until 0.8.6, because no embedded-admitted call read
+// one byte of a `Str` — `byte_of` is written with `str.byte_at_or`,
+// which is that call.
+// The route is documented at https://novo-lang.org/docs/stdlib/str.html
+
+use glob
+
+@tier(rt)
+fn main() [hw, time]
+    bsp.board.init()
+    // The shape a device actually wants: a topic filter against a
+    // topic, with no heap anywhere in the question.
+    if glob.matches("sensors/**/temp", "sensors/floor2/room7/temp")
+        hal.uart.write("PASS: glob-embedded\n")
+    else
+        hal.uart.write("FAIL: glob-embedded\n")
+    loop
+        core.rt.sleep_ms(1000)

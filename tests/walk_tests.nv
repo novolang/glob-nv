@@ -1,0 +1,155 @@
+// walk_tests.nv — the filesystem half, against a tree this file builds.
+//
+// The tree is made in a fresh temporary directory and torn down at the
+// end of each test, so the suite says the same thing on an empty
+// machine as it does in a checkout, and two of them can run at once.
+//
+// What is asserted here is what a `@test` can see: the paths, the
+// order, and that a directory the walker cannot read stops nothing.
+// The claims that need to be read off a compiler — the matcher
+// allocating nothing, the device build — are in
+// `tests/orbit/test_glob_nv.sh`, because a test function sees a return
+// value and not an allocation.
+
+use std.fs
+use std.list
+use std.test
+use glob
+use walk
+
+// The tree every test below starts from.  It has the four shapes that
+// have ever gone wrong in a walker: a file and a directory whose names
+// share a prefix, a hidden file beside a plain one, a directory nested
+// three deep, and an empty directory.
+fn build_tree() -> Str [fs]
+    let root = fs.temp_dir()
+    let _ = fs.write("${root}/a.nv", "x")
+    let _ = fs.write("${root}/b.txt", "x")
+    let _ = fs.write("${root}/.hidden.nv", "x")
+    let _ = fs.mkdir_all("${root}/src/deep/deeper")
+    let _ = fs.write("${root}/src/main.nv", "x")
+    let _ = fs.write("${root}/src/notes.txt", "x")
+    let _ = fs.write("${root}/src/.secret.nv", "x")
+    let _ = fs.write("${root}/src/deep/one.nv", "x")
+    let _ = fs.write("${root}/src/deep/deeper/three.nv", "x")
+    let _ = fs.mkdir_all("${root}/.git/objects")
+    let _ = fs.write("${root}/.git/config", "x")
+    let _ = fs.write("${root}/.git/objects/x.nv", "x")
+    let _ = fs.mkdir_all("${root}/empty")
+    root
+
+fn teardown(root: Str) [fs]
+    for p in walk.walk(root)
+        let _ = fs.delete("${root}/${p}")
+    // Directories only go once their contents have, so the deepest
+    // first: the same list, walked backwards.
+    let paths = walk.walk(root)
+    for i in 0 .. list.len(paths)
+        let p = list.get(paths, list.len(paths) - 1 - i, "")
+        let _ = fs.delete("${root}/${p}")
+    let _ = fs.delete(root)
+
+fn joined(paths: [Str]) -> Str
+    var out = ""
+    for p in paths
+        out = "${out}${p}|"
+    out
+
+@test
+fn test_a_pattern_inside_one_directory() [io, fs]
+    let root = build_tree()
+    test.case("src/*.nv names the sources in src and nothing deeper")
+    test.assert(joined(walk.expand(root, "src/*.nv")) == "src/.secret.nv|src/main.nv|")
+    test.case("*.nv is the top level only")
+    test.assert(joined(walk.expand(root, "*.nv")) == ".hidden.nv|a.nv|")
+    test.case("a pattern nothing matches is an empty list, not an error")
+    test.assert(list.len(walk.expand(root, "nothing/*")) == 0)
+    teardown(root)
+
+@test
+fn test_a_double_star_reaches_every_depth() [io, fs]
+    let root = build_tree()
+    test.case("**/*.nv")
+    test.assert(joined(walk.expand(root, "**/*.nv")) ==
+        ".git/objects/x.nv|.hidden.nv|a.nv|src/.secret.nv|src/deep/deeper/three.nv|src/deep/one.nv|src/main.nv|")
+    test.case("src/**/*.nv stays under src")
+    test.assert(joined(walk.expand(root, "src/**/*.nv")) ==
+        "src/.secret.nv|src/deep/deeper/three.nv|src/deep/one.nv|src/main.nv|")
+    teardown(root)
+
+@test
+fn test_the_order_is_depth_first_with_every_level_sorted() [io, fs]
+    // Two machines listing the same tree get the same list in the same
+    // order, which is what makes a build tool's output reproducible.
+    // `fs.read_dir` promises no order of its own, so the sort is this
+    // module's and is worth an assertion.
+    let root = build_tree()
+    test.assert(joined(walk.walk(root)) ==
+        ".git|.git/config|.git/objects|.git/objects/x.nv|.hidden.nv|a.nv|b.txt|empty|src|src/.secret.nv|src/deep|src/deep/deeper|src/deep/deeper/three.nv|src/deep/one.nv|src/main.nv|src/notes.txt|")
+    test.case("a parent always precedes its children")
+    let paths = walk.walk(root)
+    test.assert(list.get(paths, 0, "") == ".git")
+    test.assert(list.get(paths, 1, "") == ".git/config")
+    test.case("an empty directory is listed and contributes nothing else")
+    test.assert(list.contains(paths, "empty"))
+    teardown(root)
+
+@test
+fn test_the_hidden_file_rule_reaches_the_walker() [io, fs]
+    let root = build_tree()
+    let sh = glob.shell_options()
+    test.case("shell_options keeps the walker out of .git")
+    test.assert(joined(walk.expand_with(root, "**/*.nv", sh)) ==
+        "a.nv|src/deep/deeper/three.nv|src/deep/one.nv|src/main.nv|")
+    test.case("and the default reaches everything")
+    test.assert(list.len(walk.expand(root, "**/*.nv")) == 7)
+    test.case("a pattern that writes the dot still reaches a hidden file")
+    test.assert(joined(walk.expand_with(root, ".*.nv", sh)) == ".hidden.nv|")
+    teardown(root)
+
+@test
+fn test_the_depth_bound() [io, fs]
+    // The bound exists because `fs.is_dir` follows symbolic links, so a
+    // link at its own ancestor is a cycle.  It is a parameter so a
+    // caller with a known-shallow tree can say so.
+    let root = build_tree()
+    test.case("depth 0 is the root's own entries")
+    test.assert(joined(walk.walk_depth(root, 0)) ==
+        ".git|.hidden.nv|a.nv|b.txt|empty|src|")
+    test.case("depth 1 adds one level")
+    test.assert(list.len(walk.walk_depth(root, 1)) == 12)
+    test.case("depth 2 and 3 reach the bottom of this tree")
+    test.assert(list.len(walk.walk_depth(root, 2)) == 15)
+    test.assert(list.len(walk.walk_depth(root, 3)) == 16)
+    test.assert(list.len(walk.walk_depth(root, 3)) == list.len(walk.walk(root)))
+    test.case("expand_depth takes the same bound")
+    test.assert(list.len(walk.expand_depth(root, "**/*.nv", glob.options(), 0)) == 2)
+    teardown(root)
+
+@test
+fn test_a_directory_it_cannot_read_stops_nothing() [io, fs]
+    // A root that does not exist is the readable case of the same
+    // thing: `fs.read_dir` answers with an empty list rather than an
+    // error, so the walk yields nothing and does not die.  The
+    // permission case — a real directory with the read bit off — is in
+    // `tests/orbit/test_glob_nv.sh`, which can take the bit away.
+    test.assert(list.len(walk.walk("/nonexistent-glob-nv-root")) == 0)
+    test.assert(list.len(walk.expand("/nonexistent-glob-nv-root", "**")) == 0)
+    let root = build_tree()
+    test.case("and a file handed in as a root yields nothing")
+    test.assert(list.len(walk.walk("${root}/a.nv")) == 0)
+    teardown(root)
+
+@test
+fn test_filter_is_fnmatch_over_a_list() [io]
+    // The one function in `walk` that touches no filesystem.  It lives
+    // there because it BUILDS A LIST, which is the line the two modules
+    // are divided on.
+    let names = ["a.nv", "b.txt", "c.nv", ".d.nv", "sub/e.nv"]
+    test.assert(joined(walk.filter(names, "*.nv")) == "a.nv|c.nv|.d.nv|sub/e.nv|")
+    test.case("the order given is the order returned")
+    test.assert(joined(walk.filter(["c", "a", "b"], "?")) == "c|a|b|")
+    test.case("and the options reach it")
+    let ci = glob.ignore_case(glob.options())
+    test.assert(joined(walk.filter_with(["A.NV", "b.nv"], "*.nv", ci)) == "A.NV|b.nv|")
+    test.assert(joined(walk.filter(["A.NV", "b.nv"], "*.nv")) == "b.nv|")

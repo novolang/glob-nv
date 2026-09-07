@@ -1,0 +1,48 @@
+// alloc_probe.nv — the program `tests/orbit/test_glob_nv.sh` compiles
+// to read the emitted LLVM for `novo_alloc`.
+//
+// It exists to make every function of the matcher appear in one
+// module's IR under its own name.  It is built with `--opt=0` for
+// exactly that reason: at the default optimisation level the whole
+// thing inlines into `novo_main`, there is nothing left to attribute an
+// allocation to, and an assertion that no matcher function allocates
+// would pass because no matcher function is there.
+//
+// Every entry point of `glob` is called, and each of them drags in the
+// private helpers below it, so the check reads the whole module rather
+// than the four functions somebody remembered.  The answers are printed
+// rather than checked — the vector suites own correctness.  This one is
+// here to be read as text, not run.
+
+use std.str
+use glob
+
+fn main() [io]
+    let subject = "src/deep/main.nv"
+    let o = glob.options()
+    let sh = glob.shell_options()
+    let ci = glob.ignore_case(o)
+    // The path reading, in all three option shapes.
+    println(str.from_bool(glob.matches("src/**/*.nv", subject)))
+    println(str.from_bool(glob.matches_with("SRC/**/[a-z]*.NV", subject, ci)))
+    println(str.from_bool(glob.matches_with("src/*/[!.]*.nv", subject, sh)))
+    // The name reading, and the escape and class paths with it.
+    println(str.from_bool(glob.matches_name("*.nv", "main.nv")))
+    println(str.from_bool(glob.matches_name_with("[a-z]\\*?", "m*x", ci)))
+    // The walker's prefix question, which shares the machine.
+    println(str.from_bool(glob.may_descend("src/**/*.nv", "src/deep")))
+    println(str.from_bool(glob.may_descend_with("src/*.nv", ".git", sh)))
+    // The validator, and the reason it hands back.
+    let c = glob.check("src/**c/[z-a]")
+    println(str.from_bool(c.is_valid()))
+    println(str.from_int(c.offset()))
+    match glob.reason(c)
+        Valid             => println("valid")
+        UnterminatedClass => println("unterminated")
+        BadRange          => println("range")
+        DanglingEscape    => println("escape")
+        RecursiveNotWhole => println("recursive")
+    println(str.from_bool(glob.is_valid("*.nv")))
+    // The two planning helpers.
+    println(str.from_bool(glob.has_magic("src/*.nv")))
+    println(str.from_int(glob.literal_prefix_len("src/deep/*.nv")))

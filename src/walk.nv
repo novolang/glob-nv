@@ -1,0 +1,180 @@
+// walk.nv — expanding a glob against a real directory tree.
+//
+// THE OTHER HALF OF THE PACKAGE, AND WHY IT IS A SEPARATE MODULE
+//
+// `glob` promises to allocate nothing.  Everything here breaks that
+// promise on purpose: it reads directories, joins path strings and
+// returns a list, so every function below allocates and the ones that
+// touch the filesystem carry `[fs]`.
+//
+// Novo has no `[alloc]` effect to draw the line with — SPEC § 5.1's
+// vocabulary is exhaustive and `alloc` is `E3005` — so the line is this
+// file's existence.  A caller who needs the guarantee imports `glob`
+// and never names `walk`; a build either crosses the boundary or does
+// not, which is more than a naming convention could promise.
+//
+// Every function here carries `@tier(app)` explicitly.  The walker is
+// host-only by nature and the annotation says so at the declaration
+// rather than leaving it to be discovered by a device build failing.
+//
+// WHAT IT GUARANTEES
+//
+// A stable order: entries are sorted at every directory level and
+// visited depth-first, parent before child, so two machines listing the
+// same tree get the same list in the same order.
+//
+// And that it does not die on a tree it cannot fully read.  A directory
+// that cannot be opened contributes no entries and stops nothing —
+// `fs.read_dir` answers with an empty list rather than an error, which
+// is the behaviour this module wants and the reason it does not check
+// permissions itself.
+
+use std.fs
+use std.list
+use std.str
+use glob
+
+// How deep the walkers descend before they stop.
+//
+// Not a taste question: `fs.is_dir` follows symbolic links, so a link
+// pointing at its own ancestor is a cycle, and a walker with no bound
+// on it recurses until the stack ends. Sixty-four is far past any real
+// source tree and far short of that.
+const DEFAULT_MAX_DEPTH: Int = 64
+
+// The path of `name` inside `dir`, as this module writes it.
+//
+// `dir` is the RELATIVE path built so far, so the empty string is the
+// root itself and gets no separator; that is what keeps the answers
+// free of a leading `./` nobody asked for.
+fn join_rel(dir: Str, name: Str) -> Str
+    if str.len(dir) == 0
+        name
+    else
+        "${dir}/${name}"
+
+// The filesystem path of a relative path under `root`.
+fn under(root: Str, rel: Str) -> Str
+    if str.len(rel) == 0
+        root
+    else if str.len(root) == 0
+        rel
+    else
+        "${root}/${rel}"
+
+// The names in `dir`, sorted, with `.` and `..` dropped.
+//
+// `fs.read_dir` answers with an empty list for a directory it cannot
+// open, so an unreadable subtree contributes nothing and interrupts
+// nothing.
+@tier(app)
+fn entries(dir: Str) -> [Str] [fs]
+    var kept: [Str] = []
+    for name in fs.read_dir(dir)
+        if name != "." and name != ".."
+            kept = list.push(kept, name)
+    list.sort(kept)
+
+// The paths under `root` that `pattern` matches, relative to `root`.
+//
+// Depth-first, parents before children, sorted at every level.  A
+// directory no path matching the pattern could pass through is never
+// opened — that is `glob.may_descend`, and it is why expanding
+// `src/**/*.nv` over a repository does not read `target/`.
+@tier(app)
+fn collect(root: Str, rel: Str, pattern: Str, o: Options, depth: Int, acc: [Str]) -> [Str] [fs]
+    var out = acc
+    for name in entries(under(root, rel))
+        let child = join_rel(rel, name)
+        if glob.matches_with(pattern, child, o)
+            out = list.push(out, child)
+        if depth > 0 and glob.may_descend_with(pattern, child, o)
+            if fs.is_dir(under(root, child))
+                out = collect(root, child, pattern, o, depth - 1, out)
+    out
+
+// Every path under `root` that `pattern` matches, relative to `root`.
+//
+// The pattern is matched against the RELATIVE path — `src/main.nv`, not
+// `/home/you/proj/src/main.nv` — and the answers come back the same
+// way, so a caller joins them onto whatever prefix it wants and two
+// checkouts at different paths get the same list.
+//
+// Hidden files follow `glob.options()`: a `*` reaches them.  Pass
+// `glob.shell_options()` to `expand_with` for the shell's rule.
+//
+// ```novo
+// use walk
+//
+// fn main() [fs, io]
+//     for path in walk.expand("orbit/glob-nv", "src/*.nv")
+//         println(path)
+// ```
+pub @tier(app)
+fn expand(root: Str, pattern: Str) -> [Str] [fs]
+    collect(root, "", pattern, glob.options(), DEFAULT_MAX_DEPTH, [])
+
+// Every path under `root` that `pattern` matches, under `o`.
+pub @tier(app)
+fn expand_with(root: Str, pattern: Str, o: Options) -> [Str] [fs]
+    collect(root, "", pattern, o, DEFAULT_MAX_DEPTH, [])
+
+// Every path under `root` that `pattern` matches, descending at most
+// `max_depth` levels.
+//
+// `max_depth` of `0` looks at `root`'s own entries and no further.
+pub @tier(app)
+fn expand_depth(root: Str, pattern: Str, o: Options, max_depth: Int) -> [Str] [fs]
+    collect(root, "", pattern, o, max_depth, [])
+
+// Every path under `root`, relative to `root`, in the same order.
+//
+// `expand(root, "**")` written out, because walking a tree is what half
+// the callers wanted and `"**"` is not an obvious way to ask for it.
+//
+// ```novo
+// use walk
+//
+// fn main() [fs, io]
+//     println(str.from_int(list.len(walk.walk("orbit/glob-nv/src"))))
+// ```
+pub @tier(app)
+fn walk(root: Str) -> [Str] [fs]
+    collect(root, "", "**", glob.options(), DEFAULT_MAX_DEPTH, [])
+
+// Every path under `root`, descending at most `max_depth` levels.
+pub @tier(app)
+fn walk_depth(root: Str, max_depth: Int) -> [Str] [fs]
+    collect(root, "", "**", glob.options(), max_depth, [])
+
+// The members of `names` the pattern matches, in the order given.
+//
+// `fnmatch.filter`, and the one function here that touches no
+// filesystem: it lives in this module because it BUILDS A LIST, which
+// is the line these two modules are divided on.  Names are matched as
+// names — `glob.matches_name` — so a `*` in the pattern reaches every
+// byte of them.
+//
+// ```novo
+// use walk
+//
+// fn main() [io]
+//     for name in walk.filter(["a.nv", "b.txt", "c.nv"], "*.nv")
+//         println(name)
+// ```
+pub @tier(app)
+fn filter(names: [Str], pattern: Str) -> [Str]
+    var kept: [Str] = []
+    for name in names
+        if glob.matches_name(pattern, name)
+            kept = list.push(kept, name)
+    kept
+
+// The members of `names` the pattern matches under `o`, in order.
+pub @tier(app)
+fn filter_with(names: [Str], pattern: Str, o: Options) -> [Str]
+    var kept: [Str] = []
+    for name in names
+        if glob.matches_name_with(pattern, name, o)
+            kept = list.push(kept, name)
+    kept

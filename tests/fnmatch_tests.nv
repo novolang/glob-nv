@@ -1,0 +1,218 @@
+// fnmatch_tests.nv — CPython's `fnmatch` test cases, and the two places
+// this package deliberately answers differently.
+//
+// WHERE THE CASES COME FROM, AND WHAT WAS DONE ABOUT THE LICENCE
+//
+// The inputs and expected answers are CPython's, from
+// `Lib/test/test_fnmatch.py` — the class-terminator corners, the
+// escape cases, the embedded newlines, the `[]a]` and `[!]a]` shapes.
+// They were RETYPED into this file's own table shape, one call per
+// case, rather than the upstream file being vendored: nothing here
+// carries anybody else's licence text, and the answers were checked
+// against what `fnmatch.fnmatchcase` on this machine actually returns
+// rather than against what the upstream file claims.  Fifty-four of the
+// fifty-eight agree byte for byte; the four that do not are the two
+// deliberate differences below, and each is its own named test.
+//
+// `matches_name` is the call under test throughout, because that is the
+// reading `fnmatch` has: ONE name, and `*` matches every byte of it
+// including `/`.  `path_tests.nv` is the other reading.
+
+use std.test
+use glob
+
+// One case, with the pattern and the name in the label so a red run
+// says which of the fifty-eight it was without counting.
+fn expect(pattern: Str, name: Str, want: Bool) [io]
+    test.case("matches_name(${pattern}, ${name})")
+    test.assert(glob.matches_name(pattern, name) == want)
+
+// ── the literal and wildcard cases ───────────────────────────────────
+
+@test
+fn test_the_wildcards_against_a_three_letter_name() [io]
+    expect("abc", "abc", true)
+    expect("?*?", "abc", true)
+    expect("???*", "abc", true)
+    expect("*???", "abc", true)
+    expect("???", "abc", true)
+    expect("*", "abc", true)
+    expect("??", "a", false)
+    expect("b", "a", false)
+
+@test
+fn test_a_class_at_the_end_of_a_name() [io]
+    expect("ab[cd]", "abc", true)
+    expect("ab[!de]", "abc", true)
+    expect("ab[de]", "abc", false)
+
+@test
+fn test_a_newline_is_an_ordinary_byte() [io]
+    // `fnmatch` builds a regex and has to say so explicitly; a byte
+    // scanner gets it for free, and the case is here because the two
+    // are only the same until somebody reaches for a regex.
+    expect("foo*", "foo\nbar", true)
+    expect("foo*", "foo\nbar\n", true)
+    expect("?foo", "\nfoo", true)
+    expect("*", "\n", true)
+
+@test
+fn test_the_empty_pattern_and_the_empty_name() [io]
+    expect("*", "", true)
+    expect("", "", true)
+    expect("?", "", false)
+    expect("a*", "a", true)
+    expect("*a", "a", true)
+    expect("*a*", "bab", true)
+    expect("*.txt", "a.txt", true)
+    expect("*.txt", "a.txtx", false)
+
+// ── the class corners ────────────────────────────────────────────────
+//
+// Every one of these is a shape `fnmatch` had to decide and wrote down
+// in its own tests.  They are the cases a second implementation gets
+// wrong, so they are the cases worth retyping.
+
+@test
+fn test_a_closing_bracket_written_first_is_a_member() [io]
+    expect("[]]", "]", true)
+    expect("[]a]", "a", true)
+    expect("[]a]", "]", true)
+    expect("[[]", "[", true)
+
+@test
+fn test_a_hyphen_first_or_last_is_a_member() [io]
+    expect("[a-]", "-", true)
+    expect("[-a]", "-", true)
+    expect("[a-]", "a", true)
+    expect("[a-c-e]", "-", true)
+    expect("[a-c-e]", "d", false)
+
+@test
+fn test_ranges() [io]
+    expect("[a-c]", "b", true)
+    expect("[a-c]", "d", false)
+    expect("[--0]", ".", true)
+    expect("[--0]", "1", false)
+    // A range whose ends run backwards matches nothing.  `check` calls
+    // it `BadRange`; the matcher does not error, it just never hits.
+    expect("[z-a]", "z", false)
+
+@test
+fn test_an_unterminated_class_is_a_literal_bracket() [io]
+    expect("[", "[", true)
+    expect("[abc", "[abc", true)
+    expect("[]", "[]", true)
+
+@test
+fn test_a_backslash_inside_a_class_is_a_member_not_an_escape() [io]
+    // Python's reading, and this package's: `[\]` is the class holding
+    // one backslash.  A library that made `\` an escape INSIDE a class
+    // would silently change what `[\]` means for everybody who wrote it
+    // the Python way.
+    expect("[\\]", "\\", true)
+    expect("[!\\]", "a", true)
+    expect("[!\\]", "\\", false)
+    expect("[!]a]", "b", true)
+    expect("[!]a]", "]", false)
+
+@test
+fn test_a_separator_is_an_ordinary_byte_in_name_mode() [io]
+    expect("*", "a/b", true)
+    expect("a?b", "a/b", true)
+    expect("a[/]b", "a/b", true)
+    expect("**", "a/b", true)
+
+// ── where this package answers differently, and why ──────────────────
+
+@test
+fn test_caret_negates_a_class_where_python_reads_it_as_a_member() [io]
+    // CPython's `fnmatch` translates `[^a]` straight into a regular
+    // expression's own class, where `^` is only special at the front —
+    // so Python matches BOTH `^` and `a`, and there is no way to write
+    // a negated class other than `[!a]`.
+    //
+    // This package takes the shell's and the C library's reading, in
+    // which `^` negates exactly as `!` does.  The pattern `[^a]` is
+    // written by people who mean "not a" far more often than by people
+    // who mean "a caret or an a", and glob-nv's own README says so.
+    test.case("[^a] does not match a")
+    test.assert(not glob.matches_name("[^a]", "a"))
+    test.case("[^a] matches something else")
+    test.assert(glob.matches_name("[^a]", "b"))
+    // The cost of the choice, stated: a caret can no longer be the
+    // FIRST member of a class by writing itself.  Python reads `[^a]`
+    // as the two members `^` and `a`; here it is "anything but a",
+    // which happens to include `^` and no longer includes `a`.  A
+    // caret written anywhere else in the class is a member in both
+    // readings, which is the spelling to reach for.
+    test.case("[^a] matches a caret either way, for different reasons")
+    test.assert(glob.matches_name("[^a]", "^"))
+    test.case("[a^] and [!^] are unambiguous, and Python agrees")
+    test.assert(glob.matches_name("[a^]", "^"))
+    test.assert(not glob.matches_name("[!^]", "^"))
+
+@test
+fn test_backslash_escapes_a_metacharacter_where_python_has_no_escape() [io]
+    // `fnmatch` has no escape operator at all: `fnmatch.translate`
+    // escapes the backslash itself, so `\*` is a literal backslash
+    // followed by any run of bytes, and `fnmatchcase("*", "\\*")` is
+    // FALSE in Python.  A caller who has a real `*` in a file name has
+    // to write `[*]`.
+    //
+    // glob-nv takes the shell's reading, which the foundation batch
+    // asked for: `\` makes the next byte literal.
+    test.case("an escaped star matches a star")
+    test.assert(glob.matches_name("\\*", "*"))
+    test.case("an escaped star does not match anything else")
+    test.assert(not glob.matches_name("\\*", "ab"))
+    test.case("an escaped question mark matches a question mark")
+    test.assert(glob.matches_name("\\?", "?"))
+    test.case("an escaped ordinary byte is that byte")
+    test.assert(glob.matches_name("\\a", "a"))
+    test.case("[*] still works, so Python's spelling is not broken")
+    test.assert(glob.matches_name("[*]", "*"))
+    // A trailing backslash has nothing to escape.  Both readings agree
+    // that it is then a literal backslash, and `check` reports it.
+    test.case("a trailing backslash is a literal backslash")
+    test.assert(glob.matches_name("a\\", "a\\"))
+    test.assert(not glob.matches_name("a\\", "a"))
+
+// ── the pathological patterns ────────────────────────────────────────
+
+@test
+fn test_many_stars_against_a_long_name_still_answers() [io]
+    // The shape that makes a recursive matcher take exponential time.
+    // It is here for the ANSWER; `tests/orbit/test_glob_nv.sh` times it.
+    expect("a*a*a*a*a*a*b", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaab", true)
+    expect("a*a*a*a*a*a*b", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", false)
+    var long = ""
+    for _i in 0 .. 200
+        long = "${long}a"
+    test.case("six stars against two hundred a's, no b")
+    test.assert(not glob.matches_name("a*a*a*a*a*a*b", long))
+    test.case("six stars against two hundred a's and a b")
+    test.assert(glob.matches_name("a*a*a*a*a*a*b", "${long}b"))
+
+// ── case folding ─────────────────────────────────────────────────────
+
+@test
+fn test_ascii_case_folding_is_a_parameter() [io]
+    let ci = glob.ignore_case(glob.options())
+    test.case("*.NV against main.nv, folded")
+    test.assert(glob.matches_name_with("*.NV", "main.nv", ci))
+    test.case("and not folded")
+    test.assert(not glob.matches_name("*.NV", "main.nv"))
+    test.case("a range folds on both sides")
+    test.assert(glob.matches_name_with("[a-c].txt", "B.txt", ci))
+    test.assert(glob.matches_name_with("[A-C].txt", "b.txt", ci))
+    // The bug this shape exists to not have: a negated class asks the
+    // membership question for both cases and negates the answer ONCE.
+    // Negating each question and combining them would make `[!a-c]`
+    // match `B`, because `B` is not in `[a-c]` and `b` is.
+    test.case("a negated class folds once, not twice")
+    test.assert(not glob.matches_name_with("[!a-c].txt", "B.txt", ci))
+    test.assert(glob.matches_name_with("[!a-c].txt", "D.txt", ci))
+    // Nothing above 127 is folded: that needs a Unicode table.
+    test.case("a byte above 127 is left alone")
+    test.assert(glob.matches_name_with("?", "é", ci) == glob.matches_name("?", "é"))

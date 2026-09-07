@@ -1,0 +1,709 @@
+// glob.nv — glob patterns, answered against a candidate path without
+// allocating.
+//
+// WHY IT IS ITS OWN MODULE
+//
+// Everything here answers a question about two strings the caller
+// already holds.  Nothing is copied, no pattern is compiled into a
+// structure, and there is no call in this module that allocates — not
+// one.  The state a match carries is four `Int` cursors in a frame, and
+// every loop is a counted `for` over a bound computed before it starts,
+// which is what `@tier(embedded)` asks for (SPEC § 12.4).
+//
+// `walk` is the other half.  It reads directories, builds `Str` values
+// and returns a list, so every call in it allocates and carries `[fs]`.
+// A program with no heap compiles `glob` and stops there.
+//
+// Novo has no `[alloc]` effect to draw that line with: SPEC § 5.1's
+// vocabulary is exhaustive and `alloc` is `E3005`.  So the line is a
+// MODULE BOUNDARY, which a build either crosses or does not, rather
+// than a naming convention nobody can enforce.
+//
+// `*` DOES NOT CROSS A PATH SEPARATOR
+//
+// This is the one place where `fnmatch` and `glob` disagree with each
+// other and a library has to choose.  Python's `fnmatch.fnmatch("a/b",
+// "*")` is true; `glob.glob("*")` never returns `a/b`.  Rust's `glob`
+// crate takes the second reading, and so does every build tool: `*.o`
+// is meant to name object files in one directory, and a `*` that
+// swallowed `/` would make `src/*.nv` match `src/a/b/c.nv`.
+//
+// So in `matches`, `*`, `?` and a character class each stop at `/`, and
+// `**` — written as a whole path segment — is the operator that crosses
+// them.  `matches_name` is the other reading, kept because it is what
+// `fnmatch` means and what a caller filtering bare file names wants: it
+// treats the whole candidate as one name, and there `*` matches every
+// byte including `/`.
+//
+// WHAT IT IS NOT
+//
+// Not a regular-expression engine and not a translation into one.  The
+// matcher below is a direct backtracking scan that remembers the last
+// `*` it passed, so the pathological pattern — many `*`s against a long
+// candidate — costs O(pattern × candidate) rather than the exponential
+// a naive recursive matcher spends there.
+
+use std.str
+
+// ── the bytes this module names ──────────────────────────────────────
+//
+// Spelled once, at the top, because a scanner comparing against `42` is
+// a scanner nobody can review.
+
+const BANG: Int = 33
+const STAR: Int = 42
+const HYPHEN: Int = 45
+const DOT: Int = 46
+const SLASH: Int = 47
+const QUESTION: Int = 63
+const UPPER_A: Int = 65
+const UPPER_Z: Int = 90
+const LBRACKET: Int = 91
+const BACKSLASH: Int = 92
+const RBRACKET: Int = 93
+const CARET: Int = 94
+const LOWER_A: Int = 97
+const LOWER_Z: Int = 122
+const CASE_GAP: Int = 32
+
+// ── the codes a `Check` carries ──────────────────────────────────────
+//
+// A `@value` struct holds scalars only (SPEC § 14.2), so the reason a
+// pattern was refused rides in the struct as an `Int` and is read back
+// out as a `Reason` by `reason`.  These constants are private: the code
+// is an implementation detail and the enum is the surface.
+
+const R_VALID: Int = 0
+const R_UNTERMINATED_CLASS: Int = 1
+const R_BAD_RANGE: Int = 2
+const R_DANGLING_ESCAPE: Int = 3
+const R_RECURSIVE_NOT_WHOLE: Int = 4
+
+// Why a pattern was refused.
+//
+// Every one of these is a pattern `matches` will still answer for —
+// there is no error channel on a `Bool` — but the answer comes from a
+// DEGRADED reading of the pattern, and a caller about to test ten
+// thousand paths would rather hear about it once than get ten thousand
+// wrong answers.  What each degrades to is on `check`.
+pub enum Reason
+    // Nothing wrong with it.
+    Valid
+    // A `[` with no `]` after it, `[]`, or `[!]`.  Matched as a literal
+    // `[`, which is what `fnmatch` does.
+    UnterminatedClass
+    // A range whose ends run backwards, `[z-a]`.  Matches nothing.
+    BadRange
+    // A `\` at the very end of the pattern, with nothing to escape.
+    // Matched as a literal backslash.
+    DanglingEscape
+    // A `**` that is not a whole path segment — `a**b`, `**c`, `***`.
+    // Read as a single `*`, which stays inside one segment.
+    RecursiveNotWhole
+
+// How the pattern was read.
+//
+// `case_fold` folds ASCII case on both sides: `A` matches `a`, and so
+// does `[A-Z]` against `a`.  Nothing above 127 is touched, because
+// folding those needs a Unicode table and this package carries none.
+//
+// `literal_leading_dot` is the shell's hidden-file rule: with it on, a
+// `*`, `?`, class or `**` will not match a path segment beginning with
+// `.`, so only a pattern that writes the dot itself reaches `.gitignore`
+// or descends into `.git`.  It is OFF by default, which is the `glob`
+// crate's default; `shell_options` is the other one.
+pub @value
+struct Options
+    case_fold: Bool
+    literal_leading_dot: Bool
+
+// The defaults: case-sensitive, and a `*` reaches a hidden file.
+//
+// ```novo
+// use glob
+//
+// fn main() [io]
+//     let o = glob.options()
+//     println(str.from_bool(glob.matches_with("*.nv", ".hidden.nv", o)))
+// ```
+pub fn options() -> Options
+    Options { case_fold: false, literal_leading_dot: false }
+
+// Case-sensitive, and a leading `.` must be written in the pattern —
+// what Python's `glob` and every POSIX shell do.
+//
+// ```novo
+// use glob
+//
+// fn main() [io]
+//     let o = glob.shell_options()
+//     println(str.from_bool(glob.matches_with("*.nv", ".hidden.nv", o)))
+//     println(str.from_bool(glob.matches_with(".*.nv", ".hidden.nv", o)))
+// ```
+pub fn shell_options() -> Options
+    Options { case_fold: false, literal_leading_dot: true }
+
+// The same options with ASCII case folding turned on.
+pub fn ignore_case(o: Options) -> Options
+    Options { case_fold: true, literal_leading_dot: o.literal_leading_dot }
+
+// What `check` found, and where.
+//
+// `off` is the byte offset in the pattern the finding is about, or `-1`
+// when there is nothing to point at.
+pub @value
+struct Check
+    code: Int
+    off: Int
+
+impl Check
+    // True when the pattern holds no finding.
+    fn is_valid(self) -> Bool
+        self.code == R_VALID
+
+    // The byte offset the finding is about, or `-1`.
+    fn offset(self) -> Int
+        self.off
+
+// What `check` found, as an enum.
+//
+// A free function rather than a method because it is the only part of
+// the answer that is not a scalar, and `Check` is a `@value` struct.
+pub fn reason(c: Check) -> Reason
+    if c.code == R_UNTERMINATED_CLASS
+        UnterminatedClass
+    else if c.code == R_BAD_RANGE
+        BadRange
+    else if c.code == R_DANGLING_ESCAPE
+        DanglingEscape
+    else if c.code == R_RECURSIVE_NOT_WHOLE
+        RecursiveNotWhole
+    else
+        Valid
+
+// ── reading bytes ────────────────────────────────────────────────────
+
+// The byte at `i`, or `-1` past either end.
+//
+// `str.byte_at_or(s, i, d)` lowers to a bounds-checked load with a
+// select, so this is the whole cost: no call, no cell, no branch a
+// scanner would not have written itself.  It is also the spelling that
+// compiles at `@tier(embedded)` — `str.byte_at(s, i) ?? -1` lowers to
+// the same instructions and is refused there, because the tier check
+// runs before the rewrite that makes it allocation-free.
+fn byte_of(s: Str, i: Int) -> Int
+    str.byte_at_or(s, i, -1)
+
+fn to_lower(c: Int) -> Int
+    if c >= UPPER_A and c <= UPPER_Z
+        c + CASE_GAP
+    else
+        c
+
+fn to_upper(c: Int) -> Int
+    if c >= LOWER_A and c <= LOWER_Z
+        c - CASE_GAP
+    else
+        c
+
+fn eq_byte(a: Int, b: Int, o: Options) -> Bool
+    if o.case_fold
+        to_lower(a) == to_lower(b)
+    else
+        a == b
+
+// ── character classes ────────────────────────────────────────────────
+//
+// The awkward corners are all in the terminator scan, and they are the
+// same ones `fnmatch` has: a `]` written FIRST is a member and not the
+// terminator, a `!` or `^` written first negates, and `-` is a literal
+// when it is the first or the last member.  `\` is NOT an escape inside
+// a class — Python's `fnmatch` reads it as a literal backslash there,
+// and a library that disagreed would silently change what `[\\]` means.
+
+// The index one past the `]` closing the class that opens at `from`, or
+// `-1` when the class is never closed.
+fn class_end(p: Str, from: Int, to: Int) -> Int
+    var i = from + 1
+    if i < to and (byte_of(p, i) == BANG or byte_of(p, i) == CARET)
+        i = i + 1
+    // A `]` here is a member, not the terminator.
+    if i < to and byte_of(p, i) == RBRACKET
+        i = i + 1
+    for k in i .. to
+        if byte_of(p, k) == RBRACKET
+            return k + 1
+    -1
+
+// True when the class opening at `from` is negated.
+fn class_negated(p: Str, from: Int, end: Int) -> Bool
+    if from + 1 >= end - 1
+        return false
+    let c = byte_of(p, from + 1)
+    c == BANG or c == CARET
+
+// The offset of the first member of the class, past `[` and any `!`.
+fn class_first(p: Str, from: Int, end: Int) -> Int
+    if class_negated(p, from, end)
+        from + 2
+    else
+        from + 1
+
+// True when `ch` is one of the class's members, IGNORING the negation.
+//
+// Split out from `class_matches` so that case folding can ask the
+// question twice — once for each case of `ch` — and negate the answer
+// ONCE.  Negating each of the two questions and combining them gives
+// the wrong answer for `[!a]` against `A`, which is the bug this shape
+// exists to not have.
+fn class_has(p: Str, from: Int, end: Int, ch: Int) -> Bool
+    let stop = end - 1
+    var cur = class_first(p, from, end)
+    var hit = false
+    let span = stop - cur
+    for _step in 0 .. span
+        if cur < stop
+            let lo = byte_of(p, cur)
+            if cur + 2 < stop and byte_of(p, cur + 1) == HYPHEN
+                let hi = byte_of(p, cur + 2)
+                if ch >= lo and ch <= hi
+                    hit = true
+                cur = cur + 3
+            else
+                if lo == ch
+                    hit = true
+                cur = cur + 1
+    hit
+
+fn class_matches(p: Str, from: Int, end: Int, ch: Int, o: Options) -> Bool
+    var hit = class_has(p, from, end, ch)
+    if o.case_fold and not hit
+        hit = class_has(p, from, end, to_lower(ch)) or class_has(p, from, end, to_upper(ch))
+    if class_negated(p, from, end)
+        not hit
+    else
+        hit
+
+// The offset of the first backwards range in the class, or `-1`.
+fn class_bad_range(p: Str, from: Int, end: Int) -> Int
+    let stop = end - 1
+    var cur = class_first(p, from, end)
+    var bad = -1
+    let span = stop - cur
+    for _step in 0 .. span
+        if cur < stop
+            if cur + 2 < stop and byte_of(p, cur + 1) == HYPHEN
+                if bad < 0 and byte_of(p, cur + 2) < byte_of(p, cur)
+                    bad = cur
+                cur = cur + 3
+            else
+                cur = cur + 1
+    bad
+
+// ── one pattern item ─────────────────────────────────────────────────
+//
+// An item is whatever consumes exactly one candidate byte: a literal, a
+// `?`, an escaped byte, or a class.  `*` is not one of them, and the
+// matcher handles it before asking here.
+
+// The index one past the item beginning at `at`.
+//
+// A `[` that never closes and a `\` at the end of the pattern are each
+// ONE byte long, which is how they end up matching themselves.
+fn item_end(p: Str, at: Int, to: Int) -> Int
+    let c = byte_of(p, at)
+    if c == BACKSLASH
+        if at + 1 < to
+            at + 2
+        else
+            at + 1
+    else if c == LBRACKET
+        let e = class_end(p, at, to)
+        if e < 0
+            at + 1
+        else
+            e
+    else
+        at + 1
+
+// True when the item spanning `[at, end)` accepts the byte `ch`.
+fn item_matches(p: Str, at: Int, end: Int, ch: Int, o: Options) -> Bool
+    let c = byte_of(p, at)
+    if c == QUESTION
+        true
+    else if c == BACKSLASH and end == at + 2
+        eq_byte(byte_of(p, at + 1), ch, o)
+    else if c == LBRACKET and end > at + 1
+        class_matches(p, at, end, ch, o)
+    else
+        eq_byte(c, ch, o)
+
+// ── the matcher ──────────────────────────────────────────────────────
+
+// True when the pattern bytes `[p0, p1)` accept the candidate bytes
+// `[t0, t1)`.
+//
+// The loop keeps four cursors and NO STACK.  `star` is the pattern
+// offset just after the last `*` it walked past and `tstar` is how much
+// candidate that `*` has been made to swallow so far; a mismatch feeds
+// the `*` one more byte and resumes, rather than returning to a caller
+// that would try the next split itself.  `tstar` only ever increases,
+// so the whole search costs at most (pattern × candidate) steps and the
+// pathological `a*a*a*a*a*a*b` never becomes exponential.
+//
+// `budget` is that bound written where the compiler can read it.  A
+// counted `for` is the only unbounded-looking loop `@tier(embedded)`
+// admits (SPEC § 12.4), and a bound nobody can read is a bound nobody
+// has proved; the loop returns long before it is reached.
+fn match_run(p: Str, p0: Int, p1: Int, s: Str, t0: Int, t1: Int, o: Options) -> Bool
+    var pp = p0
+    var tt = t0
+    var star = -1
+    var tstar = -1
+    let budget = (p1 - p0 + 2) * (t1 - t0 + 2) + 8
+    for _step in 0 .. budget
+        if pp < p1 and byte_of(p, pp) == STAR
+            // Remember where to resume, then walk past the `*`.  A run
+            // of them collapses: each one overwrites the last, and they
+            // all resume from the same place.
+            pp = pp + 1
+            star = pp
+            tstar = tt
+        else if pp < p1 and tt < t1
+            let e = item_end(p, pp, p1)
+            if item_matches(p, pp, e, byte_of(s, tt), o)
+                pp = e
+                tt = tt + 1
+            else if star >= 0 and tstar < t1
+                tstar = tstar + 1
+                tt = tstar
+                pp = star
+            else
+                return false
+        else if pp >= p1 and tt >= t1
+            return true
+        else if pp >= p1
+            // The pattern ran out with candidate left over.  A `*` that
+            // is the last thing in the pattern eats the rest outright;
+            // otherwise give it one more byte and try again.
+            if star == p1
+                return true
+            else if star >= 0 and tstar < t1
+                tstar = tstar + 1
+                tt = tstar
+                pp = star
+            else
+                return false
+        else
+            // The candidate ran out with pattern left over.  Only `*`
+            // can match nothing, and the first branch eats those; a
+            // longer `*` would leave even less candidate behind, so
+            // there is nothing left to try.
+            return false
+    false
+
+// ── path segments ────────────────────────────────────────────────────
+
+// The index of the next `/` at or after `from`, or `to`.
+fn seg_end(s: Str, from: Int, to: Int) -> Int
+    for i in from .. to
+        if byte_of(s, i) == SLASH
+            return i
+    to
+
+// The offset of the segment after the one starting at `a`, or `-1` when
+// that one is the last.
+fn next_seg(s: Str, a: Int, n: Int) -> Int
+    let e = seg_end(s, a, n)
+    if e >= n
+        -1
+    else
+        e + 1
+
+// The length to match up to: one trailing `/` is dropped, so `a/b`
+// and `a/b/` are the same path.
+//
+// They name the same directory, `fs.read_dir` and a hand-written join
+// produce both spellings, and a matcher that said yes to one and no to
+// the other would be a bug report waiting.  A lone `/` keeps its
+// separator: dropping it would leave the empty string, which is a
+// different path.
+fn effective_len(s: Str) -> Int
+    let n = str.len(s)
+    if n > 1 and byte_of(s, n - 1) == SLASH
+        n - 1
+    else
+        n
+
+// True when the pattern segment `[a, e)` is exactly `**`.
+fn seg_is_recursive(p: Str, a: Int, n: Int) -> Bool
+    let e = seg_end(p, a, n)
+    e - a == 2 and byte_of(p, a) == STAR and byte_of(p, a + 1) == STAR
+
+// True when a wildcard segment is allowed to match this candidate
+// segment: with `literal_leading_dot` on, a segment beginning with `.`
+// is reachable only by a pattern segment that begins with a literal
+// `.` of its own.
+fn dot_ok(p: Str, pa: Int, pe: Int, s: Str, ta: Int, te: Int, o: Options) -> Bool
+    if not o.literal_leading_dot
+        return true
+    if te <= ta or byte_of(s, ta) != DOT
+        return true
+    pe > pa and byte_of(p, pa) == DOT
+
+// True when `**` may swallow the candidate segment beginning at `a`.
+fn recursive_may_enter(s: Str, a: Int, n: Int, o: Options) -> Bool
+    if not o.literal_leading_dot
+        return true
+    byte_of(s, a) != DOT
+
+// True when no candidate segment from `a` on begins with a `.`.
+//
+// A trailing `**` matches every segment that is left, so with the
+// hidden-file rule on it has to look at all of them at once.
+fn no_hidden_from(s: Str, a: Int, n: Int) -> Bool
+    var cur = a
+    for _step in 0 .. n + 1
+        if cur >= 0
+            if byte_of(s, cur) == DOT
+                return false
+            cur = next_seg(s, cur, n)
+    true
+
+// True when the pattern accepts the candidate, segment by segment.
+//
+// The same star-and-resume shape as `match_run`, one level up: `**` is
+// the `*` and a path segment is the byte.  `**` swallows ZERO segments
+// to begin with, which is what makes `a/**/b` match `a/b`.
+//
+// `prefix` asks the walker's question instead of the matcher's: it
+// changes the ONE terminal case where the candidate runs out with
+// pattern still to come — a full match calls that a failure, a prefix
+// calls it "keep looking".  Every other branch is shared, which is the
+// point of the flag: two machines that agreed today would disagree the
+// first time one of them was fixed.
+fn match_path(p: Str, s: Str, o: Options, prefix: Bool) -> Bool
+    let pn = effective_len(p)
+    let sn = effective_len(s)
+    var pa = 0
+    var ta = 0
+    var star = -1
+    var tstar = -1
+    let budget = (pn + 2) * (sn + 2) + 8
+    for _step in 0 .. budget
+        if pa >= 0 and seg_is_recursive(p, pa, pn)
+            star = next_seg(p, pa, pn)
+            tstar = ta
+            pa = star
+            if star < 0
+                // `**` is the last thing in the pattern: everything
+                // still to come is matched, hidden segments aside.
+                if not o.literal_leading_dot or ta < 0
+                    return true
+                return no_hidden_from(s, ta, sn)
+        else if pa >= 0 and ta >= 0
+            let pe = seg_end(p, pa, pn)
+            let te = seg_end(s, ta, sn)
+            if dot_ok(p, pa, pe, s, ta, te, o) and match_run(p, pa, pe, s, ta, te, o)
+                pa = next_seg(p, pa, pn)
+                ta = next_seg(s, ta, sn)
+            else if tstar >= 0 and recursive_may_enter(s, tstar, sn, o)
+                let nt = next_seg(s, tstar, sn)
+                if nt < 0
+                    return prefix
+                tstar = nt
+                ta = nt
+                pa = star
+            else
+                return false
+        else if pa < 0 and ta < 0
+            return true
+        else if pa < 0
+            if tstar >= 0 and recursive_may_enter(s, tstar, sn, o)
+                let nt = next_seg(s, tstar, sn)
+                if nt < 0
+                    return false
+                tstar = nt
+                ta = nt
+                pa = star
+            else
+                return false
+        else
+            // Candidate segments exhausted with pattern left.  For a
+            // full match only a `**` could stand there, and the first
+            // branch has already taken those; for a prefix this is
+            // exactly the directory worth descending into.
+            return prefix
+    false
+
+// ── the surface ──────────────────────────────────────────────────────
+
+// True when `pattern` matches `candidate`, read as a path.
+//
+// `?` is one byte, `*` is any run of bytes WITHIN one path segment,
+// `**` written as a whole segment is any number of segments including
+// none, `[abc]` and `[a-z]` are character classes, `[!abc]` and
+// `[^abc]` are negated ones, and `\` makes the byte after it literal.
+//
+// ```novo
+// use glob
+//
+// fn main() [io]
+//     println(str.from_bool(glob.matches("src/*.nv", "src/main.nv")))
+//     println(str.from_bool(glob.matches("src/*.nv", "src/a/b.nv")))
+//     println(str.from_bool(glob.matches("src/**/*.nv", "src/a/b.nv")))
+//     println(str.from_bool(glob.matches("[a-c]?.txt", "b1.txt")))
+// ```
+pub fn matches(pattern: Str, candidate: Str) -> Bool
+    match_path(pattern, candidate, options(), false)
+
+// True when `pattern` matches `candidate` under `o`.
+pub fn matches_with(pattern: Str, candidate: Str, o: Options) -> Bool
+    match_path(pattern, candidate, o, false)
+
+// True when some path INSIDE the directory `dir` could match.
+//
+// The question a walker asks before it lists a directory, and the
+// reason expanding `src/**/x.nv` over a big tree does not read all of
+// it: `node_modules` is not on any path `src/**/x.nv` can reach, so it
+// is never opened.  A directory that matches outright answers `true`
+// here as well, since a path under it may match too.
+//
+// ```novo
+// use glob
+//
+// fn main() [io]
+//     println(str.from_bool(glob.may_descend("src/**/x.nv", "src")))
+//     println(str.from_bool(glob.may_descend("src/**/x.nv", "src/a/b")))
+//     println(str.from_bool(glob.may_descend("src/**/x.nv", "docs")))
+// ```
+pub fn may_descend(pattern: Str, dir: Str) -> Bool
+    match_path(pattern, dir, options(), true)
+
+// True when some path inside `dir` could match, under `o`.
+pub fn may_descend_with(pattern: Str, dir: Str, o: Options) -> Bool
+    match_path(pattern, dir, o, true)
+
+// True when `pattern` matches `name` read as ONE name — `fnmatch`.
+//
+// The whole candidate is a single name here, so `*`, `?` and a class
+// each match `/` like any other byte, and `**` is just two `*`s. This
+// is what `fnmatch.fnmatch` means and what a caller filtering the
+// output of `fs.read_dir` wants; `matches` is the path reading.
+//
+// ```novo
+// use glob
+//
+// fn main() [io]
+//     println(str.from_bool(glob.matches_name("*", "a/b")))
+//     println(str.from_bool(glob.matches("*", "a/b")))
+// ```
+pub fn matches_name(pattern: Str, name: Str) -> Bool
+    match_run(pattern, 0, str.len(pattern), name, 0, str.len(name), options())
+
+// True when `pattern` matches `name` as one name, under `o`.
+pub fn matches_name_with(pattern: Str, name: Str, o: Options) -> Bool
+    match_run(pattern, 0, str.len(pattern), name, 0, str.len(name), o)
+
+// What is wrong with `pattern`, and where.
+//
+// Every finding is something `matches` will still answer for, by a
+// degraded reading written down on `Reason`.  The point of asking first
+// is that the answer is the same for every candidate: check the pattern
+// once, then match a thousand paths against it knowing what it means.
+//
+// ```novo
+// use glob
+//
+// fn main() [io]
+//     let c = glob.check("src/**.nv")
+//     println(str.from_bool(c.is_valid()))
+//     println(str.from_int(c.offset()))
+// ```
+pub fn check(pattern: Str) -> Check
+    let n = str.len(pattern)
+    var i = 0
+    for _step in 0 .. n + 1
+        if i >= n
+            return Check { code: R_VALID, off: -1 }
+        let c = byte_of(pattern, i)
+        if c == BACKSLASH
+            if i + 1 >= n
+                return Check { code: R_DANGLING_ESCAPE, off: i }
+            i = i + 2
+        else if c == LBRACKET
+            let e = class_end(pattern, i, n)
+            if e < 0
+                return Check { code: R_UNTERMINATED_CLASS, off: i }
+            let bad = class_bad_range(pattern, i, e)
+            if bad >= 0
+                return Check { code: R_BAD_RANGE, off: bad }
+            i = e
+        else if c == STAR and byte_of(pattern, i + 1) == STAR
+            let opens = i == 0 or byte_of(pattern, i - 1) == SLASH
+            let closes = i + 2 >= n or byte_of(pattern, i + 2) == SLASH
+            if opens and closes
+                i = i + 2
+            else
+                return Check { code: R_RECURSIVE_NOT_WHOLE, off: i }
+        else
+            i = i + 1
+    Check { code: R_VALID, off: -1 }
+
+// True when `check` finds nothing.
+pub fn is_valid(pattern: Str) -> Bool
+    check(pattern).is_valid()
+
+// True when the pattern holds an operator, so matching it is not the
+// same question as comparing two strings.
+//
+// `glob.has_magic` in Python, and the walker's reason for existing:
+// a pattern segment with no magic in it names one directory entry and
+// needs no listing at all.
+//
+// ```novo
+// use glob
+//
+// fn main() [io]
+//     println(str.from_bool(glob.has_magic("src/*.nv")))
+//     println(str.from_bool(glob.has_magic("src/main.nv")))
+// ```
+pub fn has_magic(pattern: Str) -> Bool
+    let n = str.len(pattern)
+    for i in 0 .. n
+        let c = byte_of(pattern, i)
+        if c == STAR or c == QUESTION or c == LBRACKET or c == BACKSLASH
+            return true
+    false
+
+// The byte offset of the first path segment holding an operator, or the
+// pattern's length when it holds none.
+//
+// The walker uses it to start where the pattern stops being a literal:
+// `src/main/**/x*.nv` needs no listing of `src` or `src/main`.
+//
+// ```novo
+// use glob
+//
+// fn main() [io]
+//     println(str.from_int(glob.literal_prefix_len("src/main/*.nv")))
+//     println(str.from_int(glob.literal_prefix_len("*.nv")))
+// ```
+pub fn literal_prefix_len(pattern: Str) -> Int
+    let n = str.len(pattern)
+    var keep = 0
+    var seg = 0
+    for i in 0 .. n + 1
+        if i == n or byte_of(pattern, i) == SLASH
+            if has_magic_in(pattern, seg, i)
+                return keep
+            keep = i
+            seg = i + 1
+    keep
+
+fn has_magic_in(p: Str, from: Int, to: Int) -> Bool
+    for i in from .. to
+        let c = byte_of(p, i)
+        if c == STAR or c == QUESTION or c == LBRACKET or c == BACKSLASH
+            return true
+    false

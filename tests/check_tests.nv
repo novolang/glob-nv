@@ -1,0 +1,118 @@
+// check_tests.nv — `check`, and what each finding degrades to.
+//
+// The contract this file holds the package to: EVERY finding names a
+// pattern `matches` still answers for, and the answer is the one
+// written down beside the finding.  A caller who never calls `check`
+// gets a sensible answer; a caller who does gets told the pattern does
+// not mean what they think it means.  Both halves are asserted here,
+// because a validator that refused a pattern the matcher then read
+// differently would be worse than no validator.
+
+use std.test
+use glob
+
+fn expect_reason(pattern: Str, want: Reason, at: Int) [io]
+    test.case("check(${pattern})")
+    let c = glob.check(pattern)
+    test.assert(not c.is_valid())
+    test.assert(glob.reason(c) == want)
+    test.assert(c.offset() == at)
+
+@test
+fn test_a_valid_pattern_has_no_finding() [io]
+    for p in ["", "a", "*.nv", "src/**/*.nv", "[a-z]?.txt", "[!abc]",
+              "[^abc]", "[]]", "a\\*b", "**", "a/**", "**/a", "[a-]",
+              "[-a]", "[a-c-e]"]
+        test.case(p)
+        let c = glob.check(p)
+        test.assert(c.is_valid())
+        test.assert(glob.reason(c) == Valid)
+        test.assert(c.offset() == -1)
+        test.assert(glob.is_valid(p))
+
+@test
+fn test_an_unterminated_class() [io]
+    // `[abc` has no `]`.  `[]` and `[!]` have one, but it is in the
+    // position where a `]` is a MEMBER rather than the terminator, so
+    // they are unterminated too — which is exactly why `fnmatch`
+    // matches all three literally.
+    expect_reason("[abc", UnterminatedClass, 0)
+    expect_reason("[]", UnterminatedClass, 0)
+    expect_reason("[!]", UnterminatedClass, 0)
+    expect_reason("[^]", UnterminatedClass, 0)
+    expect_reason("src/[abc", UnterminatedClass, 4)
+    test.case("and each of them matches as a literal bracket")
+    test.assert(glob.matches_name("[abc", "[abc"))
+    test.assert(glob.matches_name("[]", "[]"))
+    test.assert(glob.matches_name("[!]", "[!]"))
+
+@test
+fn test_a_backwards_range() [io]
+    expect_reason("[z-a]", BadRange, 1)
+    expect_reason("x[9-0]y", BadRange, 2)
+    expect_reason("[a-c][z-a]", BadRange, 6)
+    test.case("and it matches nothing rather than erroring")
+    test.assert(not glob.matches_name("[z-a]", "z"))
+    test.assert(not glob.matches_name("[z-a]", "a"))
+    test.assert(not glob.matches_name("[z-a]", "b"))
+    test.case("a one-member range is not backwards")
+    test.assert(glob.is_valid("[a-a]"))
+    test.assert(glob.matches_name("[a-a]", "a"))
+
+@test
+fn test_a_dangling_escape() [io]
+    expect_reason("a\\", DanglingEscape, 1)
+    expect_reason("\\", DanglingEscape, 0)
+    expect_reason("src/*\\", DanglingEscape, 5)
+    test.case("and it matches as a literal backslash")
+    test.assert(glob.matches_name("a\\", "a\\"))
+    test.assert(not glob.matches_name("a\\", "a"))
+
+@test
+fn test_a_double_star_that_is_not_a_whole_segment() [io]
+    // Rust's `glob` refuses to build these; here they degrade to a
+    // single `*`, which stays inside its segment.
+    expect_reason("a**b", RecursiveNotWhole, 1)
+    expect_reason("**c", RecursiveNotWhole, 0)
+    expect_reason("src/**c/x", RecursiveNotWhole, 4)
+    expect_reason("src/a**", RecursiveNotWhole, 5)
+    expect_reason("***", RecursiveNotWhole, 0)
+    expect_reason("a/***/b", RecursiveNotWhole, 2)
+    test.case("and it matches as one star")
+    test.assert(glob.matches("a**b", "aXXb"))
+    test.assert(not glob.matches("a**b", "a/b"))
+    test.case("while a whole-segment ** is valid everywhere")
+    test.assert(glob.is_valid("**"))
+    test.assert(glob.is_valid("**/a"))
+    test.assert(glob.is_valid("a/**"))
+    test.assert(glob.is_valid("a/**/b"))
+    test.assert(glob.is_valid("**/**"))
+
+@test
+fn test_the_first_finding_is_the_one_reported() [io]
+    // One finding, the earliest, so a caller fixing them one at a time
+    // makes progress rather than playing whack-a-mole with an
+    // unordered list.
+    let c = glob.check("a**b/[z-a]/x\\")
+    test.case("the ** comes first")
+    test.assert(glob.reason(c) == RecursiveNotWhole)
+    test.assert(c.offset() == 1)
+    let d = glob.check("ok/[z-a]/x\\")
+    test.case("then the range")
+    test.assert(glob.reason(d) == BadRange)
+    let e = glob.check("ok/x\\")
+    test.case("then the escape")
+    test.assert(glob.reason(e) == DanglingEscape)
+
+@test
+fn test_an_escaped_metacharacter_is_not_a_finding() [io]
+    // `\[` is a literal bracket and opens no class, so it cannot be
+    // unterminated; `\*\*` is two literal stars and is not a recursive
+    // wildcard.  The scanner has to walk escapes to know that, which is
+    // the reason this test exists.
+    test.assert(glob.is_valid("a\\[b"))
+    test.assert(glob.is_valid("\\*\\*"))
+    test.assert(glob.is_valid("\\[z-a]"))
+    test.case("and they match as literals")
+    test.assert(glob.matches_name("a\\[b", "a[b"))
+    test.assert(glob.matches_name("\\*\\*", "**"))

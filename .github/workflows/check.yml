@@ -1,0 +1,184 @@
+# check.yml — the package's CI: build, test and audit on every push;
+# publish to the Orbit registry on a `v*` tag.
+#
+# There is no build logic in this file.  Every step is a call into the
+# toolchain the user installs — `novo pkg build`, `novo test`,
+# `novo pkg publish` — or into the audit script the toolchain's own
+# repository owns.  What CI adds is a clean machine and a trigger.
+#
+# The toolchain is installed from the STABLE channel, not pinned to a
+# version: a package's job is to keep working against the release its
+# consumers have, and a pin turns "this package broke on the current
+# toolchain" into a green badge.
+
+name: check
+
+on:
+  workflow_dispatch:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: build, test and audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: clang is new enough
+        # novo compiles through LLVM and shells out to clang to build
+        # and link; it is not bundled.  clang 14 rejects the first
+        # opaque-pointer declaration novo emits, so assert the runner's
+        # version here rather than discovering it in a build failure
+        # three steps down.
+        run: |
+          set -eu
+          major=$(clang --version | head -1 | sed -n 's/.*[Vv]ersion \([0-9][0-9]*\)\..*/\1/p')
+          echo "clang major: $major"
+          if [ -z "$major" ] || [ "$major" -lt 16 ]; then
+            echo "::error::this runner's clang is $major; novo needs 16 or newer"
+            exit 1
+          fi
+
+      - name: Install the stable novo toolchain
+        run: |
+          set -eu
+          curl -fsSL https://novo-lang.org/releases/install.sh \
+            | NOVO_NO_MODIFY_PATH=1 sh
+          echo "$HOME/.novo/bin" >> "$GITHUB_PATH"
+
+      - name: Toolchain version
+        # Printed into the log so a failure downstream can be read
+        # against the release it happened on.
+        run: novo --version
+
+      - name: Build
+        run: novo pkg build
+
+      - name: Test
+        # `novo test <dir>` runs every `@test` module under it, in a
+        # stable order, with one summary and a non-zero exit if any
+        # module failed.  A directory with no `@test` module is an error
+        # in the toolchain, so a suite that quietly stopped being
+        # collected cannot pass as a green badge.
+        run: novo test tests
+
+      - name: The bug tracker is well formed
+        # The filings live in this repository, one Markdown file each,
+        # and the toolchain owns their schema — so the audit is a verb
+        # the installed toolchain already has rather than a script this
+        # repository has to carry a copy of.  It checks that a status
+        # matches its location, that the required fields are there, that
+        # a slug is its filename, that dates are ISO, and that every
+        # cross-reference is typed.
+        #
+        # A repository with no filings passes: `bugs/` ships with a
+        # README and nothing else, and an empty tree has no violations.
+        run: novo bugs audit
+
+      - name: The reference, and the examples in it
+        # `novo doc` writes the API page from the sources and COMPILES
+        # every ```novo block in a documentation comment against this
+        # package.  It exits 0 over a block that fails — the page is
+        # still worth writing — so the step greps for the warning and
+        # fails here instead.  `novo pkg publish` refuses over the same
+        # blocks, and a tag push is the wrong moment to learn that.
+        run: |
+          set -eu
+          out="$(novo doc 2>&1)"
+          printf '%s\n' "$out"
+          case "$out" in
+            *W7001*)
+              echo "::error::a documented novo example does not compile"
+              exit 1 ;;
+          esac
+
+      - name: The shard bar, strict
+        # The bar first-party packages are held to: canonical
+        # formatting, a documented and tested public surface, no dead
+        # imports, pipelines where the standard library offers one.
+        # `--strict` turns the judgement proxies into failures too,
+        # which is how you ask whether anything is left for a person to
+        # look at.
+        #
+        # FETCHED, NOT VENDORED.  The audit is two files in the
+        # toolchain's repository; a copy in every package repository
+        # would be a copy that drifts, and a stale bar is worse than
+        # none.  When novo-lang.org is not serving it the step says so
+        # and does not fail — a bar you cannot fetch is not a bar you
+        # can enforce, and failing here would teach a package author
+        # nothing about their package.
+        run: |
+          set -eu
+          mkdir -p .novo-audit
+          base=https://novo-lang.org/tools
+          if curl -fsSL -o .novo-audit/shard_audit.sh "$base/shard_audit.sh" \
+             && curl -fsSL -o .novo-audit/shard_source_audit.py "$base/shard_source_audit.py"; then
+            # The history helper is optional: without it the audit's
+            # history row reports "not applicable" for a standalone repository.
+            curl -fsSL -o .novo-audit/comment_history_refs.py "$base/comment_history_refs.py" || true
+            NOVO="$(command -v novo)" bash .novo-audit/shard_audit.sh --strict .
+          else
+            echo "::warning::novo-lang.org is not serving the shard audit; skipping it"
+          fi
+
+  publish:
+    name: Publish to Orbit
+    needs: check
+    # A tag push only.  Every other trigger builds and tests and stops:
+    # a published version is never replaced, so publishing is the one
+    # thing that must be asked for explicitly.
+    if: github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install the stable novo toolchain
+        run: |
+          set -eu
+          curl -fsSL https://novo-lang.org/releases/install.sh \
+            | NOVO_NO_MODIFY_PATH=1 sh
+          echo "$HOME/.novo/bin" >> "$GITHUB_PATH"
+
+      - name: The tag and the manifest agree
+        # A publish is permanent, and a tag that names a version the
+        # manifest does not is the one mistake that cannot be taken
+        # back: the wrong number is claimed forever and the right one
+        # is still free.  So it is checked before anything is uploaded.
+        run: |
+          set -eu
+          tag="${GITHUB_REF_NAME#v}"
+          man=$(sed -n 's/^ *version *= *"\([^"]*\)".*/\1/p' novo.toml | head -1)
+          echo "tag $tag, manifest $man"
+          if [ "$tag" != "$man" ]; then
+            echo "::error::tag v$tag does not match novo.toml version $man"
+            exit 1
+          fi
+
+      - name: What would ship
+        # Printed before the upload, because the tarball is an
+        # allow-list and this is the last moment anyone can read it.
+        run: novo pkg publish --dry-run
+
+      - name: Publish
+        # The token is read from the environment, so it is never written
+        # to disk on the runner.  Ask the registry's operator for one
+        # and add it under Settings -> Secrets and variables -> Actions.
+        #
+        # The tree is a fresh checkout of the tag, so it is clean, and
+        # the publish records the tag's commit and this package's path
+        # in it as the release's provenance.
+        env:
+          NOVO_REGISTRY_TOKEN: ${{ secrets.NOVO_REGISTRY_TOKEN }}
+        run: |
+          set -eu
+          if [ -z "${NOVO_REGISTRY_TOKEN:-}" ]; then
+            echo "::error::the NOVO_REGISTRY_TOKEN secret is not set on this repository"
+            exit 1
+          fi
+          novo pkg publish

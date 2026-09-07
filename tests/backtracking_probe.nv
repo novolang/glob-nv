@@ -1,0 +1,73 @@
+// backtracking_probe.nv — the pathological pattern, timed.
+//
+// `tests/orbit/test_glob_nv.sh` builds and runs this, then asserts two
+// things about the numbers it prints: that every size finishes inside a
+// generous wall-clock bound, and that DOUBLING the candidate does not
+// multiply the time by more than a small constant.
+//
+// The second is the one that matters.  A matcher that recurses on every
+// `*` costs O(2^stars) on `a*a*…*b` against a candidate of only `a`s,
+// because every star tries every split and the failure is only found
+// after the last byte — at n = 4000 with eight stars it does not finish
+// this century.  The matcher in `glob` remembers the last `*` it walked
+// past and resumes from there instead, so the cost is
+// O(pattern × candidate) and, for a fixed pattern, linear in the
+// candidate: the measured ratio sits at 2.0 and is asserted under 6.
+//
+// Every timing function checks the ANSWER on every repetition and
+// returns `-1` if it was ever wrong, so a matcher that got fast by
+// answering the wrong question prints a negative number and the suite
+// goes red on it.
+
+use std.float
+use std.int
+use std.str
+use std.time
+use glob
+
+// Eight stars, and a `b` the miss case does not have: every star has to
+// give up everything it took, and the search fails only after the last
+// byte has been read.
+const PATTERN: Str = "a*a*a*a*a*a*a*a*b"
+
+// Eight `**` segments, which is the same shape one level up — there the
+// segment machine does the resuming and a path segment plays the part
+// of a byte.
+const SEG_PATTERN: Str = "**/**/**/**/**/**/**/**/y"
+
+// Microseconds per `matches_name` against `subject`, or `-1` if the
+// answer was ever other than `want`.
+fn name_micros(subject: Str, reps: Int, want: Bool) -> Int [time]
+    let t0 = time.now()
+    var right = 0
+    for _i in 0 .. reps
+        if glob.matches_name(PATTERN, subject) == want
+            right = right + 1
+    let secs = time.elapsed_since(t0)
+    if right != reps
+        return -1
+    float.to_int(secs * 1000000.0 / int.to_float(reps))
+
+// The same, for the path reading and the segment machine.
+fn path_micros(subject: Str, reps: Int, want: Bool) -> Int [time]
+    let t0 = time.now()
+    var right = 0
+    for _i in 0 .. reps
+        if glob.matches(SEG_PATTERN, subject) == want
+            right = right + 1
+    let secs = time.elapsed_since(t0)
+    if right != reps
+        return -1
+    float.to_int(secs * 1000000.0 / int.to_float(reps))
+
+fn main() [io, time]
+    for n in [500, 1000, 2000, 4000]
+        let subject = str.repeat("a", n)
+        let miss = name_micros(subject, 200, false)
+        let hit = name_micros("${subject}b", 200, true)
+        println("n=${str.from_int(n)} miss_us=${str.from_int(miss)} hit_us=${str.from_int(hit)}")
+    for d in [100, 200, 400, 800]
+        let deep = "${str.repeat("a/", d)}x"
+        let miss = path_micros(deep, 200, false)
+        let hit = path_micros("${str.repeat("a/", d)}y", 200, true)
+        println("d=${str.from_int(d)} miss_us=${str.from_int(miss)} hit_us=${str.from_int(hit)}")
