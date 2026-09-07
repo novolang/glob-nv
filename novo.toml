@@ -8,7 +8,7 @@ category    = "text"
 tags        = ["glob", "fnmatch", "pattern", "wildcard", "path", "filesystem", "walk"]
 repository  = "https://github.com/novolang/glob-nv"
 maintainers = ["novo-lang"]
-novo        = ">= 0.8.5"
+novo        = ">= 0.8.6"
 
 # A library: no `main`, so `novo pkg build` type-checks and effect-checks
 # every module under `src/` and writes no binary.
