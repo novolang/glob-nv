@@ -187,7 +187,7 @@ fn test_many_stars_against_a_long_name_still_answers() [io]
     expect("a*a*a*a*a*a*b", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaab", true)
     expect("a*a*a*a*a*a*b", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", false)
     var long = ""
-    for _i in 0 .. 200
+    for _i in 0..200
         long = "${long}a"
     test.case("six stars against two hundred a's, no b")
     test.assert(not glob.matches_name("a*a*a*a*a*a*b", long))

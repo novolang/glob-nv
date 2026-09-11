@@ -229,7 +229,7 @@ fn test_many_double_stars_against_a_deep_path() [io]
     expect("**/**/**/**/x", "a/b/c/d/e/f/g/x", true)
     expect("**/**/**/**/x", "a/b/c/d/e/f/g/y", false)
     var deep = "x"
-    for _i in 0 .. 60
+    for _i in 0..60
         deep = "a/${deep}"
     test.case("four double stars against a sixty-deep path")
     test.assert(glob.matches("**/**/**/**/x", deep))

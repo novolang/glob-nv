@@ -1,10 +1,12 @@
 [package]
 name        = "glob-nv"
-version     = "0.1.0"
+version     = "0.1.1"
 description = "Glob patterns over paths: `?`, `*`, `**`, character classes and ranges, matched against a candidate without allocating, plus a filesystem walker that expands one against a directory tree in a stable order."
 license     = "Apache-2.0"
 stability   = "experimental"
 category    = "text"
+layer       = "core"
+host_modules = ["walk"]
 tags        = ["glob", "fnmatch", "pattern", "wildcard", "path", "filesystem", "walk"]
 repository  = "https://github.com/novolang/glob-nv"
 maintainers = ["novo-lang"]

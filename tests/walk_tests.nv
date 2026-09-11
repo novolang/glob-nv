@@ -44,7 +44,7 @@ fn teardown(root: Str) [fs]
     // Directories only go once their contents have, so the deepest
     // first: the same list, walked backwards.
     let paths = walk.walk(root)
-    for i in 0 .. list.len(paths)
+    for i in 0..list.len(paths)
         let p = list.get(paths, list.len(paths) - 1 - i, "")
         let _ = fs.delete("${root}/${p}")
     let _ = fs.delete(root)

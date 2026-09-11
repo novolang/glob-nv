@@ -40,7 +40,7 @@ const SEG_PATTERN: Str = "**/**/**/**/**/**/**/**/y"
 fn name_micros(subject: Str, reps: Int, want: Bool) -> Int [time]
     let t0 = time.now()
     var right = 0
-    for _i in 0 .. reps
+    for _i in 0..reps
         if glob.matches_name(PATTERN, subject) == want
             right = right + 1
     let secs = time.elapsed_since(t0)
@@ -52,7 +52,7 @@ fn name_micros(subject: Str, reps: Int, want: Bool) -> Int [time]
 fn path_micros(subject: Str, reps: Int, want: Bool) -> Int [time]
     let t0 = time.now()
     var right = 0
-    for _i in 0 .. reps
+    for _i in 0..reps
         if glob.matches(SEG_PATTERN, subject) == want
             right = right + 1
     let secs = time.elapsed_since(t0)

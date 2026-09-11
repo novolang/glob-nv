@@ -230,7 +230,7 @@ fn class_end(p: Str, from: Int, to: Int) -> Int
     // A `]` here is a member, not the terminator.
     if i < to and byte_of(p, i) == RBRACKET
         i = i + 1
-    for k in i .. to
+    for k in i..to
         if byte_of(p, k) == RBRACKET
             return k + 1
     -1
@@ -261,7 +261,7 @@ fn class_has(p: Str, from: Int, end: Int, ch: Int) -> Bool
     var cur = class_first(p, from, end)
     var hit = false
     let span = stop - cur
-    for _step in 0 .. span
+    for _step in 0..span
         if cur < stop
             let lo = byte_of(p, cur)
             if cur + 2 < stop and byte_of(p, cur + 1) == HYPHEN
@@ -290,7 +290,7 @@ fn class_bad_range(p: Str, from: Int, end: Int) -> Int
     var cur = class_first(p, from, end)
     var bad = -1
     let span = stop - cur
-    for _step in 0 .. span
+    for _step in 0..span
         if cur < stop
             if cur + 2 < stop and byte_of(p, cur + 1) == HYPHEN
                 if bad < 0 and byte_of(p, cur + 2) < byte_of(p, cur)
@@ -361,7 +361,7 @@ fn match_run(p: Str, p0: Int, p1: Int, s: Str, t0: Int, t1: Int, o: Options) -> 
     var star = -1
     var tstar = -1
     let budget = (p1 - p0 + 2) * (t1 - t0 + 2) + 8
-    for _step in 0 .. budget
+    for _step in 0..budget
         if pp < p1 and byte_of(p, pp) == STAR
             // Remember where to resume, then walk past the `*`.  A run
             // of them collapses: each one overwrites the last, and they
@@ -406,7 +406,7 @@ fn match_run(p: Str, p0: Int, p1: Int, s: Str, t0: Int, t1: Int, o: Options) -> 
 
 // The index of the next `/` at or after `from`, or `to`.
 fn seg_end(s: Str, from: Int, to: Int) -> Int
-    for i in from .. to
+    for i in from..to
         if byte_of(s, i) == SLASH
             return i
     to
@@ -463,7 +463,7 @@ fn recursive_may_enter(s: Str, a: Int, n: Int, o: Options) -> Bool
 // hidden-file rule on it has to look at all of them at once.
 fn no_hidden_from(s: Str, a: Int, n: Int) -> Bool
     var cur = a
-    for _step in 0 .. n + 1
+    for _step in 0..n + 1
         if cur >= 0
             if byte_of(s, cur) == DOT
                 return false
@@ -490,7 +490,7 @@ fn match_path(p: Str, s: Str, o: Options, prefix: Bool) -> Bool
     var star = -1
     var tstar = -1
     let budget = (pn + 2) * (sn + 2) + 8
-    for _step in 0 .. budget
+    for _step in 0..budget
         if pa >= 0 and seg_is_recursive(p, pa, pn)
             star = next_seg(p, pa, pn)
             tstar = ta
@@ -623,7 +623,7 @@ pub fn matches_name_with(pattern: Str, name: Str, o: Options) -> Bool
 pub fn check(pattern: Str) -> Check
     let n = str.len(pattern)
     var i = 0
-    for _step in 0 .. n + 1
+    for _step in 0..n + 1
         if i >= n
             return Check { code: R_VALID, off: -1 }
         let c = byte_of(pattern, i)
@@ -670,7 +670,7 @@ pub fn is_valid(pattern: Str) -> Bool
 // ```
 pub fn has_magic(pattern: Str) -> Bool
     let n = str.len(pattern)
-    for i in 0 .. n
+    for i in 0..n
         let c = byte_of(pattern, i)
         if c == STAR or c == QUESTION or c == LBRACKET or c == BACKSLASH
             return true
@@ -693,7 +693,7 @@ pub fn literal_prefix_len(pattern: Str) -> Int
     let n = str.len(pattern)
     var keep = 0
     var seg = 0
-    for i in 0 .. n + 1
+    for i in 0..n + 1
         if i == n or byte_of(pattern, i) == SLASH
             if has_magic_in(pattern, seg, i)
                 return keep
@@ -702,7 +702,7 @@ pub fn literal_prefix_len(pattern: Str) -> Int
     keep
 
 fn has_magic_in(p: Str, from: Int, to: Int) -> Bool
-    for i in from .. to
+    for i in from..to
         let c = byte_of(p, i)
         if c == STAR or c == QUESTION or c == LBRACKET or c == BACKSLASH
             return true

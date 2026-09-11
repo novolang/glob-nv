@@ -5,6 +5,10 @@ All notable changes to glob-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
+## 0.1.1 — 2026-09-09
+
+- **Declares its layer**: `layer = "core"` with `host_modules = ["walk"]` in the manifest — the public API measures to that budget and `novo pkg publish` checks the code against it.  No code changed.  The layers are described under Design in the [publishing guide](https://novo-lang.org/docs/publishing.html#design).
+
 ## [0.1.0] — 2026-09-07
 
 The first release: the matcher, the walker, and the two decisions a
